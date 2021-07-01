@@ -77,6 +77,7 @@ impl State {
 /// 8. Reverse shell shellcode: provides relevant command
 
 pub fn run() {
+    #[cfg(target_os = "windows")]
     ansi_term::enable_ansi_support().unwrap_or_else(|_| println!("Enabling ANSI support failed"));
 
     let mut state = State::PatternGeneration;
